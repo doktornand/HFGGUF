@@ -1,0 +1,5 @@
+# requirements.txt
+gradio>=3.50.0
+numpy>=1.20.0
+plotly>=5.0.0
+pandas>=1.5.0
