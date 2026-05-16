@@ -1,0 +1,11 @@
+lab/
+outputs/
+resources/
+.python-version
+ggufscan.egg-info/
+CLAUDE.md
+# Cache Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
