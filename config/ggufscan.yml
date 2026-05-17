@@ -1,0 +1,6 @@
+judge:
+  model: /mnt/data/models/Qwen3-14B-Q5_K_M.gguf
+  n_ctx: 4096
+  max_tokens: 512
+  temperature: 0.0
+  tensor_split: [0.5, 0.5]
