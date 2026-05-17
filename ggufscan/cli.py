@@ -23,6 +23,20 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+_DEFAULT_CONFIG_PATH = Path("config/ggufscan.yml")
+
+
+def _load_config(path: Path) -> dict:
+    """Load YAML config. Returns {} on missing file; raises on parse error."""
+    if not path.is_file():
+        return {}
+    import yaml
+    with path.open("r", encoding="utf-8") as fh:
+        data = yaml.safe_load(fh) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"config root must be a mapping: {path}")
+    return data
+
 from ggufscan.parser import parse
 from ggufscan.report import to_json, to_markdown, to_ragas_dataset
 from ggufscan.static_scan import StaticScanner
@@ -66,15 +80,22 @@ def build_parser() -> argparse.ArgumentParser:
                    help="RAGAS-compatible Q/A/reference dataset (JSON list, file or dir)")
 
     # --- RAGAS judge stage (runs in-process after the 3 tests, on a separate model) ---
+    p.add_argument("--config", default=str(_DEFAULT_CONFIG_PATH),
+                   help=f"Path to YAML config (default: {_DEFAULT_CONFIG_PATH}). "
+                        "`judge.model` triggers in-pipeline RAGAS eval.")
     p.add_argument("--judge-model", default=None,
-                   help="Path to judge .gguf (e.g. Qwen3-14B). If set, evaluator runs "
-                        "automatically after the dynamic tests and the report is enriched "
-                        "with a RAGAS section + LLM-generated `# Analysis Summary`.")
-    p.add_argument("--judge-n-ctx", type=int, default=4096)
+                   help="Path to judge .gguf (overrides config `judge.model`). "
+                        "If resolved (flag or config), evaluator runs automatically "
+                        "after dynamic tests and the report is enriched with a RAGAS "
+                        "section + LLM-generated `# Analysis Summary`.")
+    p.add_argument("--judge-n-ctx", type=int, default=None,
+                   help="Override config `judge.n_ctx` (default: 4096)")
     p.add_argument("--judge-tensor-split", default=None,
-                   help="tensor_split for judge model (defaults to --tensor-split if unset)")
-    p.add_argument("--judge-max-tokens", type=int, default=512)
-    p.add_argument("--judge-temperature", type=float, default=0.0)
+                   help="Override config `judge.tensor_split` (falls back to --tensor-split)")
+    p.add_argument("--judge-max-tokens", type=int, default=None,
+                   help="Override config `judge.max_tokens` (default: 512)")
+    p.add_argument("--judge-temperature", type=float, default=None,
+                   help="Override config `judge.temperature` (default: 0.0)")
     p.add_argument("--ragas-results", dest="ragas_results_out", default=None,
                    help="Enriched RAGAS JSON output (per-record metrics). "
                         "Required only to write that artifact; the section is added to "
@@ -208,6 +229,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: model not found: {model_path}", file=sys.stderr)
         return 2
 
+    cfg = _load_config(Path(args.config).expanduser())
+
     log.info("Parsing %s", model_path)
     parsed = parse(str(model_path))
     static_report = StaticScanner(parsed).scan()
@@ -264,7 +287,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"RAGAS: {out} ({len(ragas_records)} records)", file=sys.stderr)
 
     # In-pipeline judge stage (runs after the 3 tests).
-    ragas_eval = _maybe_run_judge(args, parsed, ragas_records, stem, stamp, suffix)
+    ragas_eval = _maybe_run_judge(args, ragas_records, stem, stamp, suffix, cfg)
 
     md = to_markdown(static_report, dynamic_results, ragas_eval=ragas_eval)
     if args.output:
@@ -291,29 +314,73 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def _maybe_run_judge(args, parsed, ragas_records, stem, stamp, suffix):
-    """Run the in-pipeline RAGAS judge stage if --judge-model is set.
+def _resolve_judge_cfg(args, cfg: dict) -> tuple[Path | None, dict, str | None]:
+    """Resolve judge config: --judge-* flags override config `judge.*`.
+
+    Returns (path, params, source) where source is 'flag', 'config', or None.
+    params merges defaults + config + flag overrides.
+    """
+    jc = cfg.get("judge") or {}
+    if args.judge_model:
+        path = Path(args.judge_model).expanduser()
+        source = "flag"
+    elif jc.get("model"):
+        path = Path(str(jc["model"])).expanduser()
+        source = "config"
+    else:
+        return None, {}, None
+
+    def _pick(flag_val, cfg_key, default):
+        if flag_val is not None:
+            return flag_val
+        return jc.get(cfg_key, default)
+
+    params = {
+        "n_ctx": _pick(args.judge_n_ctx, "n_ctx", 4096),
+        "max_tokens": _pick(args.judge_max_tokens, "max_tokens", 512),
+        "temperature": _pick(args.judge_temperature, "temperature", 0.0),
+        "tensor_split": _pick(args.judge_tensor_split, "tensor_split", None),
+    }
+    return path, params, source
+
+
+def _maybe_run_judge(args, ragas_records, stem, stamp, suffix, cfg: dict):
+    """Run the in-pipeline RAGAS judge stage if a judge model is resolved.
 
     Returns a dict {summary, analysis, records, judge_model} suitable for
     inclusion in the markdown / JSON report, or None if skipped.
     """
-    if args.skip_ragas_eval or not args.judge_model or not ragas_records:
+    if args.skip_ragas_eval or not ragas_records:
         return None
 
-    judge_path = Path(args.judge_model).expanduser()
-    if not judge_path.is_file():
-        print(f"WARNING: --judge-model not found: {judge_path}, skipping eval", file=sys.stderr)
+    judge_path, jparams, source = _resolve_judge_cfg(args, cfg)
+    if judge_path is None:
+        if args.ragas_out:
+            print(f"INFO: no judge resolved (set `judge.model` in {args.config} or pass "
+                  "--judge-model), skipping RAGAS eval stage", file=sys.stderr)
         return None
+
+    if not judge_path.is_file():
+        print(f"WARNING: judge model not found ({source}): {judge_path}, skipping eval",
+              file=sys.stderr)
+        return None
+    if source == "config":
+        log.info("Judge resolved from config %s: %s", args.config, judge_path)
 
     log.info("Loading judge model %s for in-pipeline RAGAS eval...", judge_path.name)
     from ggufscan.inference import ModelHandle
     from ggufscan.ragas_eval import RagasEvaluator
 
     judge_parsed = parse(str(judge_path))
-    judge_split = _parse_split(args.judge_tensor_split) \
-        if args.judge_tensor_split else _parse_split(args.tensor_split)
+    ts_raw = jparams["tensor_split"]
+    if isinstance(ts_raw, list):
+        judge_split = [float(x) for x in ts_raw]
+    elif isinstance(ts_raw, str):
+        judge_split = _parse_split(ts_raw)
+    else:
+        judge_split = _parse_split(args.tensor_split)
     judge_kwargs: dict[str, Any] = {
-        "n_ctx": args.judge_n_ctx,
+        "n_ctx": jparams["n_ctx"],
         "n_gpu_layers": args.n_gpu_layers,
         "tensor_split": judge_split,
         "chat_format": args.chat_format,
@@ -323,8 +390,8 @@ def _maybe_run_judge(args, parsed, ragas_records, stem, stamp, suffix):
     with ModelHandle(judge_parsed, embedding=False, **judge_kwargs) as judge:
         ev = RagasEvaluator(
             judge=judge,
-            max_tokens=args.judge_max_tokens,
-            temperature=args.judge_temperature,
+            max_tokens=jparams["max_tokens"],
+            temperature=jparams["temperature"],
         )
         log.info("Judging %d RAGAS records...", len(ragas_records))
         enriched = ev.evaluate_all(ragas_records)

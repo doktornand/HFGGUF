@@ -25,13 +25,13 @@ Static + dynamic security analysis for GGUF model files.
 - **RAGAS export** — every dynamic run can emit a Q/A/reference dataset
   ready to feed RAGAS (or any DPO/eval pipeline that consumes the same
   schema).
-- **RAGAS judge stage (integrated)** — pass `--judge-model X.gguf` to the
-  main CLI and a judge LLM (typically Qwen3-14B) runs after the 3 tests:
-  scores every record (alignment / refusal_quality / harm /
-  answer_relevancy_proxy / faithfulness_proxy) and generates a top-level
-  `# Analysis Summary` section in the markdown report. A standalone
-  `ggufscan-ragas` CLI + `ragas_test.sh` are also available for replay /
-  debugging on an existing `*_ragas.json`.
+- **RAGAS judge stage (integrated)** — declare a judge model in
+  `config/ggufscan.yml` (or pass `--judge-model X.gguf`) and a judge LLM
+  (typically Qwen3-14B) runs automatically after the 3 tests: scores every
+  record (alignment / refusal_quality / harm / answer_relevancy_proxy /
+  faithfulness_proxy) and generates a top-level `# Analysis Summary` section
+  in the markdown report. A standalone `ggufscan-ragas` CLI + `ragas_test.sh`
+  are also available for replay / debugging on an existing `*_ragas.json`.
 
 Available as a Python package, a CLI (`ggufscan`) and a Gradio UI (`app.py`).
 
@@ -78,10 +78,17 @@ ggufscan --model path/to/model.gguf \
 
 # Full scan + integrated RAGAS judge (Qwen3-14B grades every record,
 # Analysis Summary written to markdown).
+# Judge is resolved from config/ggufscan.yml (`judge.model`) by default;
+# CLI flags below only needed to override.
 ggufscan --model path/to/model.gguf \
          --tests jailbreak,harmful_bias,backdoor \
          --tensor-split 0.5,0.5 \
-         --output reports/ --json reports/ --ragas reports/ \
+         --output reports/ --json reports/ --ragas reports/
+
+# Override the configured judge ad-hoc:
+ggufscan --model path/to/model.gguf \
+         --tests jailbreak,harmful_bias,backdoor \
+         --output reports/ --ragas reports/ \
          --judge-model /mnt/data/models/Qwen3-14B-Q5_K_M.gguf \
          --judge-tensor-split 0.5,0.5
 
@@ -109,10 +116,11 @@ existing dir), the CLI auto-names the file `<model>_<scan|static>_<timestamp>.<e
 | `--max-tokens` | Default 256, **auto-bumped to 1024** for thinking models (qwen3, glm4, deepseek_r1) |
 | `--temperature`, `--seed` | Sampling control |
 | `--output`, `--json`, `--ragas` | Outputs (file or dir) |
-| `--judge-model` | Path to judge `.gguf`; triggers in-pipeline RAGAS judge stage |
-| `--judge-n-ctx`, `--judge-tensor-split`, `--judge-max-tokens`, `--judge-temperature` | Judge model knobs |
+| `--config` | Path to YAML config (default: `config/ggufscan.yml`). `judge.model` triggers in-pipeline judge stage. |
+| `--judge-model` | Path to judge `.gguf` (overrides config `judge.model`) |
+| `--judge-n-ctx`, `--judge-tensor-split`, `--judge-max-tokens`, `--judge-temperature` | Override matching `judge.*` config keys |
 | `--ragas-results` | Optional enriched JSON (per-record metrics + summary + analysis) |
-| `--skip-ragas-eval` | Skip the in-pipeline judge stage even if `--judge-model` is set |
+| `--skip-ragas-eval` | Skip the in-pipeline judge stage even if a judge is resolved |
 | `-v`, `-vv` | Verbosity |
 
 ---
@@ -189,9 +197,29 @@ ds = Dataset.from_list(records)
 
 ### Built-in judge stage
 
-When `--judge-model` is set on the main `ggufscan` invocation (or via the
-standalone `ggufscan-ragas` CLI), each record is graded by the judge LLM and
-the markdown report gains:
+The judge model is resolved in the following order:
+
+1. `--judge-model` CLI flag
+2. `judge.model` in the YAML config (default: `config/ggufscan.yml`, override
+   path with `--config PATH`)
+3. otherwise the eval stage is skipped (info message on stderr)
+
+Sample `config/ggufscan.yml`:
+
+```yaml
+judge:
+  model: /mnt/data/models/Qwen3-14B-Q5_K_M.gguf
+  n_ctx: 4096
+  max_tokens: 512
+  temperature: 0.0
+  tensor_split: [0.5, 0.5]   # null for single-GPU
+```
+
+`--judge-n-ctx`, `--judge-max-tokens`, `--judge-temperature`,
+`--judge-tensor-split` override the matching config keys on a per-run basis.
+
+When a judge is resolved (or the standalone `ggufscan-ragas` CLI is invoked),
+each record is graded by the judge LLM and the markdown report gains:
 
 - A top-level `# Analysis Summary` section (LLM-generated narrative, ≤ 250
   words) prepended to the report.
@@ -230,8 +258,10 @@ ggufscan/
 ├── inference.py       # ModelHandle: llama-cpp wrapper, tensor_split, cleanup
 ├── judge.py           # RefusalClassifier (regex EN + FR)
 ├── report.py          # JSON + Markdown + RAGAS renderers
+├── ragas_eval.py      # RagasEvaluator (LLM-as-judge, <think>-aware)
+├── ragas_cli.py       # ggufscan-ragas standalone console script
 ├── utils.py           # strip_think()
-├── cli.py             # argparse entry-point
+├── cli.py             # argparse entry-point + YAML config loader
 ├── data/
 │   ├── refusal_patterns.yaml
 │   └── prompts/{jailbreak,harmful,bias,backdoor_baseline}.yaml
@@ -240,6 +270,8 @@ ggufscan/
     ├── jailbreak.py
     ├── harmful_bias.py
     └── backdoor.py
+config/
+└── ggufscan.yml       # judge model + params (default config path)
 ```
 
 ### Two-phase execution (and why)
