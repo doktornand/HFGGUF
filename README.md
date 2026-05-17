@@ -98,8 +98,6 @@ ggufscan-ragas \
   --judge-model /mnt/data/models/Qwen3-14B-Q5_K_M.gguf \
   --tensor-split 0.5,0.5 \
   --output-json reports/ --output-md reports/
-# or use the prepared smoke script (edit placeholders first):
-./ragas_test.sh
 ```
 
 When `--output` / `--json` / `--ragas` point to a directory (trailing `/` or
